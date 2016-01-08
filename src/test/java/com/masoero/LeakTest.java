@@ -12,8 +12,10 @@ import java.util.Collection;
 import java.util.LinkedList;
 import java.util.concurrent.TimeUnit;
 
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
+import org.junit.Rule;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,24 +30,29 @@ import io.netty.util.ResourceLeakDetector;
 import io.netty.util.ResourceLeakDetector.Level;
 import io.reactivex.netty.protocol.http.UnicastContentSubject;
 import rx.Observable;
+import rx.internal.operators.BufferUntilSubscriber;
 import rx.subjects.ReplaySubject;
 
+/** Normal response: 
+ * - Llega con refCnt:2, es liberado por ribbon siempre y cuando se ejecute toObservable(). Sino, hay que agregar un release.
+ * 
+ * Fallback response:
+ * - Llega con refCnt:1, no lo libera nadie. Hay que liberarlo manualente si es direct buffer, o usar un heap buffer.
+ * 
+ * @author esteban
+ *
+ */
 public class LeakTest {
 	
 	static Logger logger = LoggerFactory.getLogger(LeakTest.class);
 
 	private ObjectMapper mapper = new ObjectMapper();
 	
-	@ClassRule
-	public static WireMockRule wireMockRule = new WireMockRule(8081);	
+	@Rule
+	public WireMockRule wireMockRule = new WireMockRule(8081);	
 	
-	@BeforeClass
-	public static void setUpBeforeClass() throws Exception {
-		
-		ConfigurationManager.loadPropertiesFromResources("basic-config.properties");
-		
-		ResourceLeakDetector.setLevel(Level.PARANOID);
-		
+	@Before
+	public void before(){
 		stubFor(get(urlEqualTo("/person"))
 				.willReturn(aResponse()
 						.withStatus(200)
@@ -58,29 +65,38 @@ public class LeakTest {
 						.withHeader("Content-Type", "application/json")
 						.withBody("{\"status\":\"neverToReadBody\"}")));
 	}
+	
+	@BeforeClass
+	public static void setUpBeforeClass() throws Exception {
+		
+		ConfigurationManager.loadPropertiesFromResources("basic-config.properties");
+		
+		ResourceLeakDetector.setLevel(Level.PARANOID);
+		
+	}
 
 	@Test
 	public void getBlockingWithOkResponse() {
 		PersonProxy proxy = Ribbon.from(PersonProxy.class);
 		for (int i = 0; i < 10; i++) {
 			logger.info("Calling: " + i);
-//			sleep(500);
+			
 			ByteBuf byteBuff = proxy.getOk().execute();
 			
-			Response response = parseResponse(byteBuff);
+			Response response = parseResponseAndReleaseBuffer(byteBuff, 1);
 			
 			assertEquals(response.getStatus(), "success");			
 		}
 	}
 
 	@Test
-	public void getBlockingWith500ResponseAndFallback() {
+	public void getBlockingWith500ResponseAndFallbackWithUnPooledAllocatorHeapFallbackHandler() {
 		PersonProxy proxy = Ribbon.from(PersonProxy.class);
 		for (int i = 0; i < 10; i++) {
 			
-			ByteBuf byteBuff = proxy.getFallback().execute();
+			ByteBuf byteBuff = proxy.getFallbackWithHeapAllocator().execute();
 			
-			Response response = parseResponse(byteBuff);
+			Response response = parseResponseAndReleaseBuffer(byteBuff);
 			
 			assertEquals(response.getStatus(), "fail");			
 		}
@@ -88,58 +104,102 @@ public class LeakTest {
 	
 	private void sleep(int millis) {
 		try {
-			Thread.sleep(millis);
+			Thread.sleep(0);
 		} catch (InterruptedException e) {
 		}
 	}
 	
 	@Test
-	public void getNonBlockingWithOkResponse() {
+	public void getNonBlockingWithToObservableWithOkResponseThenParsingWithoutReleasingThenBlocking() {
 		PersonProxy proxy = Ribbon.from(PersonProxy.class);
-//		Collection<UnicastContentSubject<Response>> responses = new LinkedList<>();
-		for (int i = 0; i < 1000; i++) {
+		for (int i = 0; i < 1; i++) {
 			logger.info("Calling: " + i);
-//			proxy.getOk().observe();
-			Observable<Response> byteBuff = proxy.getOk().toObservable().map(this::parseResponse);
-//			UnicastContentSubject<Response> subject = UnicastContentSubject.createWithoutNoSubscriptionTimeout();
-			ReplaySubject<Object> subject = ReplaySubject.create();
-			byteBuff.subscribe(subject);
-//			subject.disposeIfNotSubscribed();			
-//			responses.add(subject);
+			Observable<Response> response = proxy.getOk().toObservable().map((buf) -> parseResponseAndReleaseBuffer(buf, 0));
+			response.toBlocking().last();
 		}
-//		for (UnicastContentSubject<Response> subject : responses) {
-//		}
+		sleep(1000);
 	}
 	
 	@Test
-	public void getNonBlockingWith500ResponseAndFallback() {
+	public void getNonBlockingWithObserveWithOkResponseThenParsingWithoutReleasingThenBlocking() {
 		PersonProxy proxy = Ribbon.from(PersonProxy.class);
-//		Collection<UnicastContentSubject<Response>> responses = new LinkedList<>();
-		for (int i = 0; i < 1000; i++) {
+		for (int i = 0; i < 10; i++) {
 			logger.info("Calling: " + i);
-//			proxy.getOk().observe();
-			Observable<Response> byteBuff = proxy.getFallback().toObservable().map(this::parseResponse);
-//			UnicastContentSubject<Response> subject = UnicastContentSubject.createWithoutNoSubscriptionTimeout();
+			Observable<Response> response = proxy.getOk().observe().map((buf) -> parseResponseAndReleaseBuffer(buf, 1));
+			response.toBlocking().last();
+		}
+		sleep(1000);
+	}
+	
+	@Test
+	public void getNonBlockingWithOkResponseThenParsingWithoutReleasingWithAsyncSubscription() {
+		PersonProxy proxy = Ribbon.from(PersonProxy.class);
+		for (int i = 0; i < 1; i++) {
+			logger.info("Calling: " + i);
+			Observable<Response> response = proxy.getOk().toObservable().map((buf) -> parseResponseAndReleaseBuffer(buf, 0));
+			ReplaySubject<Response> subject = ReplaySubject.create();
+			response.subscribe(subject);
+		}
+		logger.info(" === End calls ==== ");
+		sleep(1000);
+	}
+	
+	@Test
+	public void getNonBlockingWithOkResponseWithoutParsingWithoutReleaseForgetting() {
+		PersonProxy proxy = Ribbon.from(PersonProxy.class);
+		for (int i = 0; i < 100; i++) {
+			logger.info("Calling: " + i);
+			proxy.getOk().observe();
+		}
+		logger.info(" === End calls ==== ");
+		sleep(1000);
+	}
+	
+	@Test
+	public void getNonBlockingWith500ResponseAndFallbackWithPooledAllocator() {
+		PersonProxy proxy = Ribbon.from(PersonProxy.class);
+		for (int i = 0; i < 100; i++) {
+			logger.info("Calling: " + i);
+			Observable<Response> byteBuff = proxy.getFallbackWithUnPooledDirectAllocator().toObservable().map((buf) -> parseResponseAndReleaseBuffer(buf, 1));
 			ReplaySubject<Object> subject = ReplaySubject.create();
 			byteBuff.subscribe(subject);
-//			subject.disposeIfNotSubscribed();			
-//			responses.add(subject);
 		}
-//		for (UnicastContentSubject<Response> subject : responses) {
-//		}
+		logger.info(" === End calls ==== ");
+		sleep(5000);
+	}
+	
+	@Test
+	public void getNonBlockingWith500ResponseAndFallbackWithheapAllocator() {
+		PersonProxy proxy = Ribbon.from(PersonProxy.class);
+		for (int i = 0; i < 100; i++) {
+			logger.info("Calling: " + i);
+			Observable<Response> byteBuff = proxy.getFallbackWithHeapAllocator().toObservable().map((buf) -> parseResponseAndReleaseBuffer(buf, 0));
+			ReplaySubject<Object> subject = ReplaySubject.create();
+			byteBuff.subscribe(subject);
+		}
+		logger.info(" === End calls ==== ");
+		sleep(1000);
 	}
 	
 	
-	private Response parseResponse(ByteBuf byteBuff) {
+	private Response parseResponseAndReleaseBuffer(ByteBuf byteBuff) {
+		return this.parseResponseAndReleaseBuffer(byteBuff, 1);
+	}
+	
+	private Response parseResponseAndReleaseBuffer(ByteBuf byteBuff, int timesToRelease) {
 		try {
 			String stringBytes = byteBuff.toString(Charset.defaultCharset());
 			return mapper.readValue(stringBytes, Response.class);
 		} catch (IOException e) {
 			throw new RuntimeException(e);
 		} finally {
-			byteBuff.release();
-			logger.info("byteBuff released. Refcount:" + byteBuff.refCnt());
-//			logger.info("byteBuff Refcount:" + byteBuff.refCnt());
+			logger.info("byteBuff Refcount:" + byteBuff.refCnt());
+			if (byteBuff.isDirect() && timesToRelease > 0){
+				byteBuff.release(timesToRelease);
+				logger.info("byteBuff released {} times (isDirect:{}). Refcount: {}", timesToRelease, byteBuff.isDirect(), byteBuff.refCnt());				
+			} else {
+				logger.info("byteBuff NOT released {} times (isDirect:{}). Refcount: {}", timesToRelease, byteBuff.isDirect(), byteBuff.refCnt());
+			}
 		}
 	}
 

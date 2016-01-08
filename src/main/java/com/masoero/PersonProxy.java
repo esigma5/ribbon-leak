@@ -9,10 +9,14 @@ import io.netty.buffer.ByteBuf;
 
 public interface PersonProxy {
 	@Http(method = HttpMethod.GET, uri = "/person")
-	@Hystrix(fallbackHandler = PersonServiceFallbackHandler.class, validator = PersonServiceResponseValidator.class)
+	@Hystrix(validator = PersonServiceResponseValidator.class)
 	RibbonRequest<ByteBuf> getOk();
 	
 	@Http(method = HttpMethod.GET, uri = "/personFail")
-	@Hystrix(fallbackHandler = PersonServiceFallbackHandler.class, validator = PersonServiceResponseValidator.class)
-	RibbonRequest<ByteBuf> getFallback();
+	@Hystrix(fallbackHandler = UnPooledAllocatorHeapFallbackHandler.class, validator = PersonServiceResponseValidator.class)
+	RibbonRequest<ByteBuf> getFallbackWithHeapAllocator();
+	
+	@Http(method = HttpMethod.GET, uri = "/personFail")
+	@Hystrix(fallbackHandler = UnPooledAllocatorFallbackHandler.class, validator = PersonServiceResponseValidator.class)
+	RibbonRequest<ByteBuf> getFallbackWithUnPooledDirectAllocator();
 }
